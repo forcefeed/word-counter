@@ -2,14 +2,20 @@
 
 import re
 import json
+import time
 import requests
 from collections import defaultdict
 from sseclient import SSEClient
 from bs4 import BeautifulSoup
+from redis import StrictRedis
+from pymongo import MongoClient
 
 
+wrap_time = 86400
 persian_chars = '\u200cآابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهیءؤئأ'
-all_words = defaultdict(int)
+redis = StrictRedis()
+all_words = {}
+mongo_client = MongoClient()
 
 
 def normalize_text(text):
@@ -77,6 +83,8 @@ def normalize_words(words):
 
 
 def add_post(post):
+    global all_words
+
     html = '<div><div>{}</div><div>{}</div></div>'.format(
         post['title'], post['description'])
     soup = BeautifulSoup(html, 'lxml')
@@ -86,21 +94,77 @@ def add_post(post):
     words = text.split(' ')
     words = normalize_words(words)
 
-    new_words = set(words) - set(all_words)
+    new_words = set(words) - all_words
 
-    for w in words:
-        all_words[w] += 1
+    with redis.pipeline(transaction=False) as pipe:
+        pipe.incr('trends:docs')
+        if words:
+            pipe.sadd('trends:words', *words)
+            all_words.update(words)
 
-    top = list(reversed(sorted(all_words.items(), key=lambda r: r[1])))[:10]
+        for w in words:
+            pipe.incr('trends:' + w + ':count')
 
-    print('Unique words:', len(all_words))
+        for w in set(words):
+            pipe.incr('trends:' + w + ':docs')
+
+        pipe.execute()
+
+    word_counts = [(w, int(redis.get('trends:{}:count'.format(w))))
+                   for w in all_words]
+    top = list(reversed(sorted(word_counts, key=lambda r: r[1])))[:10]
+
+    print('Doc #{}'.format(int(redis.get('trends:docs'))))
+    print('Unique words:', redis.scard('trends:words'))
     print('New words:', ', '.join(new_words))
-    print('Top words:', ', '.join('{}={}'.format(w, c) for w, c in top))
+    print('Top words:', ', '.join(
+        '{}={} [docs={}]'
+        .format(w, c, int(redis.get('trends:{}:docs'.format(w))))
+        for w, c in top))
     print()
+
+    now = int(time.time())
+    last_updated = redis.get('trends:lastupdate')
+    if last_updated:
+        last_updated = int(last_updated)
+    else:
+        last_updated = now
+        redis.set('trends:lastupdate', last_updated)
+    if now - last_updated > wrap_time:
+        print('Wrapping...')
+
+        words = [
+            {
+                'word': w,
+                'total': int(redis.get('trends:{}:count'.format(w))),
+                'docs': int(redis.get('trends:{}:docs'.format(w)))
+            }
+            for w in all_words
+        ]
+        doc = {
+            'timestamp': now,
+            'words': words,
+        }
+
+        mongo_client.trends.periods.insert_one(doc)
+
+        wraps = redis.incr('trends:wraps')
+        redis.flushdb()
+        redis.set('trends:wraps', wraps)
+        redis.set('trends:lastupdate', now)
+        all_words = set()
+
+        print('Wrap complete.')
+        print()
 
 
 def main():
+    global all_words
+
     url = 'http://forcefeed.ir/sse'
+
+    print('Getting current words...')
+    all_words = {w.decode() for w in redis.smembers('trends:words')}
 
     print('Connecting to forcefeed...')
     client = SSEClient(requests.get(url, stream=True))
@@ -116,8 +180,12 @@ def main():
 
     print('Received {} events.'.format(nevents))
 
-    top = list(reversed(sorted(all_words.items(), key=lambda r: r[1])))[:1000]
-    print('Top 1000:', ', '.join('{}={}'.format(w, c) for w, c in top))
+    words = [(w,
+              int(redis.get('trends:{}:count'.format(w))),
+              int(redis.get('trends:{}:docs'.format(w))))
+             for w in all_words]
+    top = list(reversed(sorted(words, key=lambda r: r[1])))[:1000]
+    print('Top 1000:', ', '.join('{}={},{}'.format(w, total, docs) for w, total, docs in top))
 
 
 if __name__ == '__main__':
